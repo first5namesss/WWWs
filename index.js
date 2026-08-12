@@ -8,7 +8,7 @@ const fs = require('fs');
 const fetch = (...a) => import('node-fetch').then(({ default: f }) => f(...a));
 
 // ─────────────────────────────────────
-//  READ FROM ENVIRONMENT VARIABLES (Railway)
+//  READ FROM ENVIRONMENT VARIABLES
 // ─────────────────────────────────────
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
@@ -22,6 +22,9 @@ if (!BOT_TOKEN || !CLIENT_ID || !OWNER_ID) {
 
 const DB_FILE   = "./data.json";
 const KEYS_FILE = "./keys.json";
+
+// Customize this delay (in milliseconds) between each channel send
+const CHANNEL_DELAY_MS = 10000; // 10 seconds – safe & human-like
 
 function loadDB() {
   if (!fs.existsSync(DB_FILE)) fs.writeFileSync(DB_FILE, JSON.stringify({ users: {} }, null, 2));
@@ -70,10 +73,11 @@ function scheduleJob(uid, cfg) {
       const result = await sendSelfMsg(cfg.userToken, channelId, cfg.message);
       if (!result.ok) {
         console.error(`[${uid}] Failed to send to ${channelId}: ${result.error}`);
-        // Optionally break or continue – we continue to keep trying other channels
+        // Continue to next channel anyway
       }
+      // Wait between sends (10 seconds now)
       if (i < cfg.channelIds.length - 1) {
-        await delay(2000); // 2 seconds between sends
+        await delay(CHANNEL_DELAY_MS);
       }
     }
     // Schedule next run
@@ -83,7 +87,7 @@ function scheduleJob(uid, cfg) {
     activeJobs[uid].timer = setTimeout(fire, nextDelay);
   };
   activeJobs[uid] = { ...cfg, timer: null };
-  fire(); // Start immediately
+  fire(); // Start immediately without a test message
 }
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
@@ -245,7 +249,7 @@ client.on('interactionCreate', async interaction => {
     const channelCount = cfg.channelIds ? cfg.channelIds.length : 0;
     return interaction.reply({
       content: activeJobs[uid]
-        ? `🟢 Running — posting to **${channelCount}** channel${channelCount > 1 ? 's' : ''} every ~**${cfg.intervalMin} minutes**.`
+        ? `🟢 Running — posting to **${channelCount}** channel${channelCount > 1 ? 's' : ''} every ~**${cfg.intervalMin} minutes** with 10s between each channel.`
         : '🔴 Stopped — use `/panel` to start.',
       ephemeral: true
     });
@@ -312,19 +316,13 @@ client.on('interactionCreate', async interaction => {
     
     await interaction.deferReply({ ephemeral: true });
     
-    // Test first channel
+    // Test first channel (only one test to avoid extra sends)
     const test = await sendSelfMsg(userToken, channelIds[0], message);
     if (!test.ok)
       return interaction.editReply(`❌ Test failed on channel ${channelIds[0]}: \`${test.error}\`\nCheck your token and channel ID.`);
     
-    // Test remaining channels (up to 3 to avoid rate limits)
-    for (let i = 1; i < Math.min(channelIds.length, 3); i++) {
-      const testExtra = await sendSelfMsg(userToken, channelIds[i], message);
-      if (!testExtra.ok) {
-        return interaction.editReply(`❌ Test failed on channel ${channelIds[i]}: \`${testExtra.error}\`\nPlease check this channel ID.`);
-      }
-      await delay(1000);
-    }
+    // (Optional) test second channel with delay – but we'll skip to reduce risk
+    // We trust the user entered correct IDs.
     
     const db = loadDB();
     if (!db.users[uid]) return interaction.editReply('No key found. Use /claim first.');
@@ -334,11 +332,11 @@ client.on('interactionCreate', async interaction => {
     
     const channelMentions = channelIds.map(id => `<#${id}>`).join(', ');
     return interaction.editReply(
-      `✅ **Saved and started!**\nPosting to **${channelIds.length}** channel${channelIds.length > 1 ? 's' : ''}: ${channelMentions}\nEvery **~${intervalMin} minutes**.\nUse \`/stop\` to stop anytime.`
+      `✅ **Saved and started!**\nPosting to **${channelIds.length}** channel${channelIds.length > 1 ? 's' : ''}: ${channelMentions}\nEvery **~${intervalMin} minutes** with **10 seconds** between each channel.\nUse \`/stop\` to stop anytime.`
     );
   }
 
-  // ─── FIXED: panel_start – no test send, just start ───
+  // ─── START BUTTON – NO TEST ──────────────────
   if (interaction.isButton() && interaction.customId === 'panel_start') {
     const uid = interaction.user.id;
     const db = loadDB();
@@ -350,14 +348,11 @@ client.on('interactionCreate', async interaction => {
       return interaction.reply({ content: 'No channels configured. Use Setup to add channels.', ephemeral: true });
     }
 
-    // Stop any existing job to avoid duplicates
     stopJob(uid);
-
-    // Start the job directly – no test to avoid rate-limit
     scheduleJob(uid, cfg);
 
     return interaction.reply({
-      content: `✅ Started! Posting to **${cfg.channelIds.length}** channel${cfg.channelIds.length > 1 ? 's' : ''} every ~**${cfg.intervalMin}** minutes.`,
+      content: `✅ Started! Posting to **${cfg.channelIds.length}** channel${cfg.channelIds.length > 1 ? 's' : ''} every ~**${cfg.intervalMin}** minutes with 10s between each.`,
       ephemeral: true
     });
   }
