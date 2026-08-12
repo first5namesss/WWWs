@@ -8,11 +8,16 @@ const fs = require('fs');
 const fetch = (...a) => import('node-fetch').then(({ default: f }) => f(...a));
 
 // ─────────────────────────────────────
-//  FILL THESE IN
+//  READ FROM ENVIRONMENT VARIABLES (Railway)
 // ─────────────────────────────────────
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const CLIENT_ID = "1525544199762739340";
-const OWNER_ID  = "1173953184113360910";
+const CLIENT_ID = process.env.CLIENT_ID;
+const OWNER_ID  = process.env.OWNER_ID;
+
+if (!BOT_TOKEN || !CLIENT_ID || !OWNER_ID) {
+  console.error("❌ Missing required env vars: BOT_TOKEN, CLIENT_ID, OWNER_ID");
+  process.exit(1);
+}
 // ─────────────────────────────────────
 
 const DB_FILE   = "./data.json";
@@ -32,9 +37,9 @@ function saveKeys(k) { fs.writeFileSync(KEYS_FILE, JSON.stringify(k, null, 2)); 
 const activeJobs = {};
 
 function stopJob(uid) {
-  if (activeJobs[uid]) { 
-    clearTimeout(activeJobs[uid].timer); 
-    delete activeJobs[uid]; 
+  if (activeJobs[uid]) {
+    clearTimeout(activeJobs[uid].timer);
+    delete activeJobs[uid];
   }
 }
 
@@ -55,36 +60,30 @@ async function sendSelfMsg(userToken, channelId, message) {
   } catch (e) { return { ok: false, error: e.message }; }
 }
 
-// ─── NEW: delay helper ───
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 function scheduleJob(uid, cfg) {
   stopJob(uid);
-  // Use an async function so we can await delays
   const fire = async () => {
-    // Send messages with 2-second delay between channels
     for (let i = 0; i < cfg.channelIds.length; i++) {
       const channelId = cfg.channelIds[i];
       const result = await sendSelfMsg(cfg.userToken, channelId, cfg.message);
       if (!result.ok) {
         console.error(`[${uid}] Failed to send to ${channelId}: ${result.error}`);
-        // Optionally continue to next channel
+        // Optionally break or continue – we continue to keep trying other channels
       }
-      // Delay between sends (2 seconds) – adjust as needed
       if (i < cfg.channelIds.length - 1) {
-        await delay(2000); // 2 seconds
+        await delay(2000); // 2 seconds between sends
       }
     }
-    // Schedule next run after interval (plus jitter)
+    // Schedule next run
     const base = cfg.intervalMin * 60000;
-    const jitter = (Math.random() * 4 - 2) * 60000; // ±2 min
+    const jitter = (Math.random() * 4 - 2) * 60000;
     const nextDelay = Math.max(base + jitter, 60000);
     activeJobs[uid].timer = setTimeout(fire, nextDelay);
   };
-  // Store config and start
   activeJobs[uid] = { ...cfg, timer: null };
-  // Execute first run immediately (or we could delay first run)
-  fire();
+  fire(); // Start immediately
 }
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
@@ -118,6 +117,7 @@ client.once('ready', async () => {
 
 client.on('interactionCreate', async interaction => {
 
+  // ─── OWNER COMMANDS ──────────────────────────
   if (interaction.isChatInputCommand() && interaction.commandName === 'genkeys') {
     if (interaction.user.id !== OWNER_ID)
       return interaction.reply({ content: 'Owner only.', ephemeral: true });
@@ -133,7 +133,7 @@ client.on('interactionCreate', async interaction => {
     saveKeys(keys);
     fs.writeFileSync('./generated_keys.txt', generated.join('\n'));
     return interaction.reply({
-      content: `Generated **${amount}** keys. Keys do not expire.`,
+      content: `Generated **${amount}** keys.`,
       files: ['./generated_keys.txt'],
       ephemeral: true
     });
@@ -171,6 +171,7 @@ client.on('interactionCreate', async interaction => {
     return interaction.reply({ content: `Revoked key from <@${target.id}>. Key \`${userKey}\` is now available again.`, ephemeral: true });
   }
 
+  // ─── USER COMMANDS ──────────────────────────
   if (interaction.isChatInputCommand() && interaction.commandName === 'claim') {
     const keyInput = interaction.options.getString('key').trim().toUpperCase();
     const keys = loadKeys();
@@ -258,6 +259,7 @@ client.on('interactionCreate', async interaction => {
     return interaction.reply({ content: '🔴 Auto-adv stopped.', ephemeral: true });
   }
 
+  // ─── BUTTONS & MODALS ──────────────────────────
   if (interaction.isButton() && interaction.customId === 'panel_setup') {
     const uid = interaction.user.id;
     const cfg = loadDB().users[uid]?.config || {};
@@ -321,7 +323,6 @@ client.on('interactionCreate', async interaction => {
       if (!testExtra.ok) {
         return interaction.editReply(`❌ Test failed on channel ${channelIds[i]}: \`${testExtra.error}\`\nPlease check this channel ID.`);
       }
-      // small delay between tests
       await delay(1000);
     }
     
@@ -337,18 +338,28 @@ client.on('interactionCreate', async interaction => {
     );
   }
 
+  // ─── FIXED: panel_start – no test send, just start ───
   if (interaction.isButton() && interaction.customId === 'panel_start') {
     const uid = interaction.user.id;
-    const cfg = loadDB().users[uid]?.config;
+    const db = loadDB();
+    const userData = db.users[uid];
+    if (!userData) return interaction.reply({ content: 'You have not claimed a key.', ephemeral: true });
+    const cfg = userData.config;
     if (!cfg) return interaction.reply({ content: 'No config yet. Use Setup first.', ephemeral: true });
     if (!cfg.channelIds || cfg.channelIds.length === 0) {
       return interaction.reply({ content: 'No channels configured. Use Setup to add channels.', ephemeral: true });
     }
-    await interaction.deferReply({ ephemeral: true });
-    const test = await sendSelfMsg(cfg.userToken, cfg.channelIds[0], cfg.message);
-    if (!test.ok) return interaction.editReply(`❌ Failed: \`${test.error}\``);
+
+    // Stop any existing job to avoid duplicates
+    stopJob(uid);
+
+    // Start the job directly – no test to avoid rate-limit
     scheduleJob(uid, cfg);
-    return interaction.editReply(`✅ Started! Posting to ${cfg.channelIds.length} channels every ~${cfg.intervalMin} min.`);
+
+    return interaction.reply({
+      content: `✅ Started! Posting to **${cfg.channelIds.length}** channel${cfg.channelIds.length > 1 ? 's' : ''} every ~**${cfg.intervalMin}** minutes.`,
+      ephemeral: true
+    });
   }
 
   if (interaction.isButton() && interaction.customId === 'panel_stop') {
