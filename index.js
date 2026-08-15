@@ -7,9 +7,6 @@ const {
 const fs = require('fs');
 const fetch = (...a) => import('node-fetch').then(({ default: f }) => f(...a));
 
-// ─────────────────────────────────────
-//  READ FROM ENVIRONMENT VARIABLES
-// ─────────────────────────────────────
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const OWNER_ID  = process.env.OWNER_ID;
@@ -18,14 +15,10 @@ if (!BOT_TOKEN || !CLIENT_ID || !OWNER_ID) {
   console.error("❌ Missing required env vars: BOT_TOKEN, CLIENT_ID, OWNER_ID");
   process.exit(1);
 }
-// ─────────────────────────────────────
 
-// ─── CUSTOM DELAY PATTERN (in milliseconds) ───
-// For each channel index, wait this long BEFORE sending to that channel.
-// Index 0 → 20s, Index 1 → 30s, Index 2 → 45s, then 30s for any additional.
 const CHANNEL_WAITS = [20000, 30000, 45000];
-const DEFAULT_WAIT = 30000; // fallback for channels beyond the pattern
-// ─────────────────────────────────────
+const DEFAULT_WAIT = 30000;
+const INITIAL_GRACE_DELAY = 5000;
 
 const DB_FILE   = "./data.json";
 const KEYS_FILE = "./keys.json";
@@ -47,6 +40,7 @@ function stopJob(uid) {
   if (activeJobs[uid]) {
     clearTimeout(activeJobs[uid].timer);
     delete activeJobs[uid];
+    console.log(`[${uid}] Job stopped.`);
   }
 }
 
@@ -62,7 +56,10 @@ async function sendSelfMsg(userToken, channelId, message) {
       body: JSON.stringify({ content: message })
     });
     const data = await res.json();
-    if (!res.ok) return { ok: false, error: data.message || JSON.stringify(data) };
+    if (!res.ok) {
+      return { ok: false, error: data.message || JSON.stringify(data), status: res.status };
+    }
+    console.log(`✅ Sent to ${channelId} (ID: ${data.id})`);
     return { ok: true, id: data.id };
   } catch (e) { return { ok: false, error: e.message }; }
 }
@@ -72,48 +69,46 @@ const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 function scheduleJob(uid, cfg) {
   stopJob(uid);
   const fire = async () => {
-    // Loop through each channel with the custom delays
+    console.log(`[${uid}] Cycle started. Sending to ${cfg.channelIds.length} channels.`);
     for (let i = 0; i < cfg.channelIds.length; i++) {
       const channelId = cfg.channelIds[i];
-      // Determine wait time for this channel
       const waitMs = (i < CHANNEL_WAITS.length) ? CHANNEL_WAITS[i] : DEFAULT_WAIT;
-      // Wait before sending
-      await delay(waitMs);
-      // Send the message
+      const actualWait = (i === 0) ? waitMs + INITIAL_GRACE_DELAY : waitMs;
+      console.log(`[${uid}] Waiting ${actualWait/1000}s before sending to ${channelId}...`);
+      await delay(actualWait);
       const result = await sendSelfMsg(cfg.userToken, channelId, cfg.message);
       if (!result.ok) {
-        console.error(`[${uid}] Failed to send to ${channelId}: ${result.error}`);
+        console.error(`[${uid}] ❌ Failed to send to ${channelId}: ${result.error} (status ${result.status})`);
+        if (result.status === 401 || result.status === 429) {
+          console.error(`[${uid}] Token invalid or rate-limited. Stopping job.`);
+          stopJob(uid);
+          return;
+        }
       }
     }
-    // Schedule next run after interval + jitter
+    if (!activeJobs[uid]) return;
     const base = cfg.intervalMin * 60000;
     const jitter = (Math.random() * 4 - 2) * 60000;
     const nextDelay = Math.max(base + jitter, 60000);
+    console.log(`[${uid}] Cycle complete. Next run in ${Math.round(nextDelay/1000)}s.`);
     activeJobs[uid].timer = setTimeout(fire, nextDelay);
   };
   activeJobs[uid] = { ...cfg, timer: null };
-  fire(); // Start immediately – it will wait before first send
+  fire();
 }
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
 const commands = [
-  new SlashCommandBuilder()
-    .setName('claim').setDescription('Claim your Auto-Adv license key')
+  new SlashCommandBuilder().setName('claim').setDescription('Claim your Auto-Adv license key')
     .addStringOption(o => o.setName('key').setDescription('Your license key').setRequired(true)),
-  new SlashCommandBuilder()
-    .setName('panel').setDescription('Open your Auto-Adv control panel'),
-  new SlashCommandBuilder()
-    .setName('status').setDescription('Check if your auto-adv is running'),
-  new SlashCommandBuilder()
-    .setName('stop').setDescription('Stop your auto-adv'),
-  new SlashCommandBuilder()
-    .setName('genkeys').setDescription('[Owner only] Generate license keys')
+  new SlashCommandBuilder().setName('panel').setDescription('Open your Auto-Adv control panel'),
+  new SlashCommandBuilder().setName('status').setDescription('Check if your auto-adv is running'),
+  new SlashCommandBuilder().setName('stop').setDescription('Stop your auto-adv'),
+  new SlashCommandBuilder().setName('genkeys').setDescription('[Owner only] Generate license keys')
     .addIntegerOption(o => o.setName('amount').setDescription('How many keys (max 100)').setRequired(true)),
-  new SlashCommandBuilder()
-    .setName('listkeys').setDescription('[Owner only] List all keys'),
-  new SlashCommandBuilder()
-    .setName('revokekey').setDescription('[Owner only] Revoke a users key')
+  new SlashCommandBuilder().setName('listkeys').setDescription('[Owner only] List all keys'),
+  new SlashCommandBuilder().setName('revokekey').setDescription('[Owner only] Revoke a users key')
     .addUserOption(o => o.setName('user').setDescription('User to revoke').setRequired(true)),
 ].map(c => c.toJSON());
 
@@ -125,7 +120,6 @@ client.once('ready', async () => {
 });
 
 client.on('interactionCreate', async interaction => {
-
   // ─── OWNER COMMANDS ──────────────────────────
   if (interaction.isChatInputCommand() && interaction.commandName === 'genkeys') {
     if (interaction.user.id !== OWNER_ID)
@@ -321,10 +315,13 @@ client.on('interactionCreate', async interaction => {
     
     await interaction.deferReply({ ephemeral: true });
     
-    // Test first channel only (to avoid extra spam)
     const test = await sendSelfMsg(userToken, channelIds[0], message);
-    if (!test.ok)
-      return interaction.editReply(`❌ Test failed on channel ${channelIds[0]}: \`${test.error}\`\nCheck your token and channel ID.`);
+    if (!test.ok) {
+      if (test.status === 401) {
+        return interaction.editReply(`❌ Token is invalid or revoked. Please get a new token and try again.`);
+      }
+      return interaction.editReply(`❌ Test failed on channel ${channelIds[0]}: \`${test.error}\``);
+    }
     
     const db = loadDB();
     if (!db.users[uid]) return interaction.editReply('No key found. Use /claim first.');
@@ -338,7 +335,6 @@ client.on('interactionCreate', async interaction => {
     );
   }
 
-  // ─── START BUTTON – NO TEST, JUST START ──────
   if (interaction.isButton() && interaction.customId === 'panel_start') {
     const uid = interaction.user.id;
     const db = loadDB();
