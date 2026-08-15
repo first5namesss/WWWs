@@ -20,11 +20,15 @@ if (!BOT_TOKEN || !CLIENT_ID || !OWNER_ID) {
 }
 // ─────────────────────────────────────
 
+// ─── CUSTOM DELAY PATTERN (in milliseconds) ───
+// For each channel index, wait this long BEFORE sending to that channel.
+// Index 0 → 20s, Index 1 → 30s, Index 2 → 45s, then 30s for any additional.
+const CHANNEL_WAITS = [20000, 30000, 45000];
+const DEFAULT_WAIT = 30000; // fallback for channels beyond the pattern
+// ─────────────────────────────────────
+
 const DB_FILE   = "./data.json";
 const KEYS_FILE = "./keys.json";
-
-// Customize this delay (in milliseconds) between each channel send
-const CHANNEL_DELAY_MS = 10000; // 10 seconds – safe & human-like
 
 function loadDB() {
   if (!fs.existsSync(DB_FILE)) fs.writeFileSync(DB_FILE, JSON.stringify({ users: {} }, null, 2));
@@ -68,26 +72,27 @@ const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 function scheduleJob(uid, cfg) {
   stopJob(uid);
   const fire = async () => {
+    // Loop through each channel with the custom delays
     for (let i = 0; i < cfg.channelIds.length; i++) {
       const channelId = cfg.channelIds[i];
+      // Determine wait time for this channel
+      const waitMs = (i < CHANNEL_WAITS.length) ? CHANNEL_WAITS[i] : DEFAULT_WAIT;
+      // Wait before sending
+      await delay(waitMs);
+      // Send the message
       const result = await sendSelfMsg(cfg.userToken, channelId, cfg.message);
       if (!result.ok) {
         console.error(`[${uid}] Failed to send to ${channelId}: ${result.error}`);
-        // Continue to next channel anyway
-      }
-      // Wait between sends (10 seconds now)
-      if (i < cfg.channelIds.length - 1) {
-        await delay(CHANNEL_DELAY_MS);
       }
     }
-    // Schedule next run
+    // Schedule next run after interval + jitter
     const base = cfg.intervalMin * 60000;
     const jitter = (Math.random() * 4 - 2) * 60000;
     const nextDelay = Math.max(base + jitter, 60000);
     activeJobs[uid].timer = setTimeout(fire, nextDelay);
   };
   activeJobs[uid] = { ...cfg, timer: null };
-  fire(); // Start immediately without a test message
+  fire(); // Start immediately – it will wait before first send
 }
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
@@ -249,7 +254,7 @@ client.on('interactionCreate', async interaction => {
     const channelCount = cfg.channelIds ? cfg.channelIds.length : 0;
     return interaction.reply({
       content: activeJobs[uid]
-        ? `🟢 Running — posting to **${channelCount}** channel${channelCount > 1 ? 's' : ''} every ~**${cfg.intervalMin} minutes** with 10s between each channel.`
+        ? `🟢 Running — posting to **${channelCount}** channel${channelCount > 1 ? 's' : ''} every ~**${cfg.intervalMin} minutes** with custom delays.`
         : '🔴 Stopped — use `/panel` to start.',
       ephemeral: true
     });
@@ -316,13 +321,10 @@ client.on('interactionCreate', async interaction => {
     
     await interaction.deferReply({ ephemeral: true });
     
-    // Test first channel (only one test to avoid extra sends)
+    // Test first channel only (to avoid extra spam)
     const test = await sendSelfMsg(userToken, channelIds[0], message);
     if (!test.ok)
       return interaction.editReply(`❌ Test failed on channel ${channelIds[0]}: \`${test.error}\`\nCheck your token and channel ID.`);
-    
-    // (Optional) test second channel with delay – but we'll skip to reduce risk
-    // We trust the user entered correct IDs.
     
     const db = loadDB();
     if (!db.users[uid]) return interaction.editReply('No key found. Use /claim first.');
@@ -332,11 +334,11 @@ client.on('interactionCreate', async interaction => {
     
     const channelMentions = channelIds.map(id => `<#${id}>`).join(', ');
     return interaction.editReply(
-      `✅ **Saved and started!**\nPosting to **${channelIds.length}** channel${channelIds.length > 1 ? 's' : ''}: ${channelMentions}\nEvery **~${intervalMin} minutes** with **10 seconds** between each channel.\nUse \`/stop\` to stop anytime.`
+      `✅ **Saved and started!**\nPosting to **${channelIds.length}** channel${channelIds.length > 1 ? 's' : ''}: ${channelMentions}\nEvery **~${intervalMin} minutes** with custom delays (20s, 30s, 45s...).\nUse \`/stop\` to stop anytime.`
     );
   }
 
-  // ─── START BUTTON – NO TEST ──────────────────
+  // ─── START BUTTON – NO TEST, JUST START ──────
   if (interaction.isButton() && interaction.customId === 'panel_start') {
     const uid = interaction.user.id;
     const db = loadDB();
@@ -352,7 +354,7 @@ client.on('interactionCreate', async interaction => {
     scheduleJob(uid, cfg);
 
     return interaction.reply({
-      content: `✅ Started! Posting to **${cfg.channelIds.length}** channel${cfg.channelIds.length > 1 ? 's' : ''} every ~**${cfg.intervalMin}** minutes with 10s between each.`,
+      content: `✅ Started! Posting to **${cfg.channelIds.length}** channel${cfg.channelIds.length > 1 ? 's' : ''} every ~**${cfg.intervalMin}** minutes with custom delays.`,
       ephemeral: true
     });
   }
